@@ -196,6 +196,3 @@ Firewall:
 - Subnet de management aislada.
 
 ---
-
-# 📄 Archivo listo para descargar
-
