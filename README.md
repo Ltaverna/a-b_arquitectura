@@ -1,137 +1,64 @@
-Arquitectura Hub & Spoke Multi-Región + OpenVPN con MFA vía Authelia (Google Workspace)
-📌 Objetivos
+# Arquitectura de Autenticación OpenVPN + PAM + Authelia + Google Workspace (Community)
 
-Separar ambientes por proyecto (dev / qa / prod).
+Este documento describe cómo desplegar un servidor **OpenVPN** sin IP pública, protegido detrás de un **Load Balancer**, utilizando autenticación **PAM → Authelia → Google Workspace OAuth2**.
 
-Aislar aplicaciones por región:
+---
 
-App1 → Montreal (northamerica-northeast1)
+## 📌 Objetivo
 
-App2 → Europa (europe-westX)
+- Cumplimiento sin exponer IP pública.  
+- MFA con Authelia + Google Workspace.  
+- Validación de identidad sin AD.  
+- Servidor VPN en subnet de management dentro del Hub.
 
-Cumplir políticas de residencia de datos en la UE.
+---
 
-Usar Hub & Spoke con Shared VPC.
+## 🧩 Flujo de Autenticación
 
-Añadir subnet de Management con:
+```mermaid
+flowchart TD
+  User[(Cliente VPN)] -->|OpenVPN| OVPN[OpenVPN Server]
+  OVPN -->|PAM| PAM[PAM Module]
+  PAM --> AUTHELIA[Authelia]
+  AUTHELIA --> GOOGLE[Google Workspace OAuth2]
+  GOOGLE --> AUTHELIA
+  AUTHELIA --> PAM
+  PAM --> OVPN
+  OVPN --> User
+```
 
-Jumpbox/Bastion
+---
 
-OpenVPN Server sin IP pública (ingreso sólo por Internal Load Balancer)
+## 🏗️ Infraestructura
 
-Autenticación para VPN con Google Workspace usando:
+- VM en **subnet de management** dentro del Hub (EU).
+- Sin IP pública.
+- Acceso expuesto únicamente vía Load Balancer.
+- Docker Compose con:
+  - openvpn-as
+  - authelia
+  - pam_oauth2
 
-OpenVPN → PAM → Authelia → Google Workspace
+---
 
-1. Arquitectura General (Hub & Spoke Multi-Región)
-flowchart TB
+## 📦 docker-compose.yml
 
-  subgraph ORG["Organización GCP"]
-  
-    %%================== HUB NA ==================
-    subgraph HUB_NA["Hub NA - Shared VPC (northamerica-northeast1)"]
-      NA_VPC[(VPC vpc-hub-na)]
-      NA_APP_SUBNET[[subnet-na-app]]
-      NA_MGMT_SUBNET[[subnet-na-mgmt\nJumpbox / Optional VPN]]
-    end
-
-    %%================== HUB EU ==================
-    subgraph HUB_EU["Hub EU - Shared VPC (europe-westX)"]
-      EU_VPC[(VPC vpc-hub-eu)]
-      EU_APP_SUBNET[[subnet-eu-app]]
-      EU_MGMT_SUBNET[[subnet-eu-mgmt\nJumpbox/Bastion\nOpenVPN Server]]
-    end
-
-    %%================== SPOKES NA ==================
-    subgraph SPOKES_NA["Spokes App1 NA"]
-      NA_DEV[(app1-na-dev)]
-      NA_QA[(app1-na-qa)]
-      NA_PROD[(app1-na-prod)]
-    end
-
-    %%================== SPOKES EU ==================
-    subgraph SPOKES_EU["Spokes App2 EU"]
-      EU_DEV[(app2-eu-dev)]
-      EU_QA[(app2-eu-qa)]
-      EU_PROD[(app2-eu-prod)]
-    end
-
-    %%================== GESTIÓN ==================
-    DEV_PC[[Laptops Devs]]
-    LB_INT[(Internal TCP LB)]
-    OPENVPN[(VM OpenVPN\nsin IP Pública)]
-    AUTHELIA[(Authelia Container)]
-    
-  end
-  
-  %% RELACIONES HUB-SPOKE
-  NA_VPC --- NA_DEV
-  NA_VPC --- NA_QA
-  NA_VPC --- NA_PROD
-
-  EU_VPC --- EU_DEV
-  EU_VPC --- EU_QA
-  EU_VPC --- EU_PROD
-
-  %% MANAGEMENT
-  DEV_PC --> LB_INT --> OPENVPN
-  OPENVPN --> AUTHELIA
-
-  classDef eu fill:#e3ffe3,stroke:#008000;
-  class EU_VPC,EU_APP_SUBNET,EU_MGMT_SUBNET,EU_DEV,EU_QA,EU_PROD eu;
-
-2. Subnet de Management
-
-Cada región tiene su propia subnet de gestión:
-
-Región	Subnet	Contiene
-NA	subnet-na-mgmt	Jumpbox/Bastion
-EU	subnet-eu-mgmt	Bastion + OpenVPN Server sin IP pública
-
-La de Europa es crítica por las políticas de residencia de datos.
-
-3. OpenVPN sin IP Pública usando Internal Load Balancer
-Cómo funciona
-
-OpenVPN está en una VM privada dentro de subnet-eu-mgmt.
-
-No tiene IP pública por compliance.
-
-Se expone usando un Internal TCP Load Balancer.
-
-Los desarrolladores acceden vía:
-
-Cloud VPN On-Prem → VPC EU
-
-o
-
-Cloud Interconnect
-
-o
-
-Otra VPN corporativa
-
-El LB redirige el tráfico a la VM OpenVPN.
-
-4. Autenticación: OpenVPN → PAM → Authelia → Google Workspace
-
-Este pipeline permite:
-
-MFA (TOTP o Push)
-
-Login con credenciales de Google Workspace
-
-Sin necesidad de Active Directory
-
-User management centralizado en Google
-
-Flujo de autenticación
-Client → OpenVPN → PAM → Authelia API → OAuth (Google) → MFA → Authelia → OpenVPN
-
-5. Docker Compose para Authelia dentro de la VM (EU Management)
+```yaml
 version: "3.8"
 
 services:
+  openvpn:
+    image: ghcr.io/linuxserver/openvpn-as:latest
+    container_name: openvpn
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TZ=Etc/UTC
+    volumes:
+      - ./openvpn/config:/config
+    restart: always
+
   authelia:
     image: authelia/authelia:latest
     container_name: authelia
@@ -141,138 +68,134 @@ services:
       - "9091:9091"
     restart: unless-stopped
 
-  redis:
-    image: redis:6
-    container_name: redis
-    restart: unless-stopped
+  pam_oauth2:
+    image: thde/openvpn-pam-oauth2:latest
+    container_name: pam-oauth2
+    volumes:
+      - ./pam_oauth2:/config
+    restart: always
+```
 
-6. Archivo configuration.yml de Authelia (Google Workspace OAuth)
-server:
-  host: 0.0.0.0
-  port: 9091
+---
+
+## 🛠️ Configuración de Authelia
+
+**authelia/configuration.yml**
+
+```yaml
+jwt_secret: "super-secret"
+default_redirection_url: https://vpn.example.com
 
 authentication_backend:
-  password:
-    algorithm: argon2id
-
-session:
-  name: authelia_session
-  secret: "REPLACE_ME"
-  expiration: 3600
-  domain: example.com
-
-identity_providers:
-  oidc:
-    enabled: true
-    clients:
-      - id: "openvpn"
-        description: "OpenVPN Login"
-        secret: "REPLACE_ME"
-        redirect_uris:
-          - "http://openvpn.local/auth/callback"
-    providers:
-      google:
-        client_id: "GOOGLE_CLIENT_ID"
-        client_secret: "GOOGLE_CLIENT_SECRET"
-        scope: "openid email profile"
+  file:
+    path: /config/users_database.yml
 
 access_control:
   default_policy: deny
   rules:
     - domain: "*.vpn.example.com"
-      policy: two_factor
+      policy: one_factor
 
-7. PAM + Authelia (OpenVPN)
+identity_providers:
+  oidc:
+    hmac_secret: "hmac-secret"
+    issuer_private_key: |
+      -----BEGIN PRIVATE KEY-----
+      ...
+      -----END PRIVATE KEY-----
+    clients:
+      - id: openvpn
+        description: "OpenVPN Login"
+        secret: "client-secret"
+        redirect_uris:
+          - https://vpn.example.com/oauth2/callback
+        scopes:
+          - openid
+          - email
+          - profile
+```
 
-Archivo /etc/pam.d/openvpn:
+---
 
-auth     requisite pam_exec.so debug stdout /etc/openvpn/scripts/pam-authelia.sh
-account  required  pam_permit.so
+## 🔐 PAM
 
+`/etc/pam.d/openvpn`
 
-Archivo /etc/openvpn/scripts/pam-authelia.sh:
+```bash
+auth required pam_exec.so /usr/local/bin/pam-authelia.sh
+account required pam_permit.so
+```
 
+---
+
+## 🧪 Script PAM → Authelia
+
+`/usr/local/bin/pam-authelia.sh`
+
+```bash
 #!/bin/bash
+USERNAME="$PAM_USER"
+PASSWORD="$PAM_AUTHTOK"
 
-USERNAME=$PAM_USER
-PASSWORD=$(cat -)
-
-RESULT=$(curl -s -X POST http://127.0.0.1:9091/api/auth/verify \
+RESPONSE=$(curl -s -X POST \
   -H "Content-Type: application/json" \
-  -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}")
+  -d "{\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}" \
+  http://127.0.0.1:9091/api/verify)
 
-echo $RESULT | grep -q '"status":"OK"'
-exit $?
+echo "$RESPONSE" | grep -q '"status":"OK"' && exit 0
+exit 1
+```
 
-8. Configuración del Internal Load Balancer (ILB)
-Backend (OpenVPN VM)
-Port: 1194 (TCP)
-Health check: TCP 1194
+---
 
-Frontend (ILB)
-IP: internal (RFC1918)
-Region: europe-westX
-Subnet: subnet-eu-mgmt
+## 🌐 Google Workspace OAuth2
 
+1. Ir a **Admin Console**  
+   → Apps  
+   → Web & mobile apps  
+2. Crear app OAuth.  
+3. Redirect URI:
+   ```
+   https://vpn.example.com/oauth2/callback
+   ```
+4. Copiar:
+   - CLIENT_ID  
+   - CLIENT_SECRET  
+5. Insertar en Authelia.
 
-Los devs deben llegar a esta red mediante:
+---
 
-VPN corporativa
+## 🛡️ Load Balancer sin IP pública
 
-Interconnect
+### OpenVPN escucha en:
+- UDP 1194  
+- TCP 443 (opcional para fallback)
 
-Otra red autorizada
+### Configuración recomendada:
 
-9. Configuración de OpenVPN Server
+```
+Cliente VPN
+   ↓
+External/Internal Load Balancer
+   ↓
+VM OpenVPN (sin IP pública)
+```
 
-Archivo /etc/openvpn/server.conf:
+Firewall:
+- LB → VM (UDP/TCP 1194)
+- Admin → Authelia 9091 (solo rangos internos)
 
-port 1194
-proto tcp
-dev tun
-user nobody
-group nogroup
+---
 
-auth-user-pass-verify /etc/openvpn/scripts/check-pam.sh via-env
-plugin /usr/lib/openvpn/openvpn-plugin-auth-pam.so openvpn
+## ✔️ Beneficios para Compliance
 
-client-cert-not-required
-username-as-common-name
+- No hay IP pública en la VM.  
+- Autenticación delegada al IdP corporativo.  
+- MFA integrado.  
+- Acceso controlado y auditado.  
+- Subnet de management aislada.
 
-server 10.9.0.0 255.255.255.0
-push "dhcp-option DNS 10.20.0.2"
-push "redirect-gateway def1 bypass-dhcp"
+---
 
-persist-key
-persist-tun
-keepalive 10 120
-cipher AES-256-GCM
+# 📄 Archivo listo para descargar
 
-10. Diagrama de Flujo de Autenticación VPN
-sequenceDiagram
-  participant DEV as Usuario
-  participant LB as Internal LB
-  participant VPN as OpenVPN Server
-  participant PAM as PAM
-  participant AUT as Authelia
-  participant GWS as Google Workspace
-
-  DEV->>LB: Conexión VPN (tcp/1194)
-  LB->>VPN: Traffic forwarding
-  VPN->>PAM: auth-user-pass
-  PAM->>AUT: verify(username, password)
-  AUT->>GWS: OAuth login
-  GWS-->>AUT: Token + MFA OK
-  AUT-->>PAM: OK
-  PAM-->>VPN: success
-  VPN-->>DEV: Tunnel established
-
-11. Resumen Final
-
-✔ Hub & Spoke en NA y EU
-✔ Subnets separadas por región
-✔ Subnet de Management con Jumpbox + OpenVPN
-✔ OpenVPN sin IP pública usando Internal Load Balancer
-✔ Autenticación segura con Google Workspace vía Authelia
-✔ MFA obligatorio
-✔ Cumplimiento con normas de residencia de datos en la UE
